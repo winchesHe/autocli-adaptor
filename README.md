@@ -1,0 +1,1 @@
+# autocli-adaptor
