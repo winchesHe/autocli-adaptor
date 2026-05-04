@@ -1,0 +1,8 @@
+{
+  "llm": {
+    "endpoint": null,
+    "apikey": null,
+    "modelname": null
+  },
+  "autocli-token": "acli_5fbc3720cd65be178d674cef7da3d4b78d35d024ec4dacf71a0f03e1"
+}

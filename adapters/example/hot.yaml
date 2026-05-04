@@ -1,0 +1,40 @@
+site: example
+meta_title: "Example Domain"
+name: hot
+description: 获取示例域名的热门内容
+domain: www.example.com
+tags: [documentation, placeholder, generic]
+strategy: cookie
+browser: true
+
+args:
+  limit:
+    type: int
+    default: 10
+    description: 返回结果数量
+
+pipeline:
+  - navigate: https://www.example.com
+  - evaluate: |
+      (async () => {
+      const results = [];
+        const limit = ${{ args.limit }};
+      
+        const h1 = document.querySelector('h1')?.textContent?.trim() || '';
+        const paragraphs = document.querySelectorAll('p');
+        const link = document.querySelector('a')?.href || '';
+      
+        if (h1) {
+          results.push({
+            rank: 1,
+            title: h1,
+            description: Array.from(paragraphs).map(p => p.textContent?.trim()).filter(Boolean).join(' '),
+            url: link
+          });
+        }
+      
+        return results;
+      })()
+  - limit: ${{ args.limit }}
+
+columns: [rank, title, description, url]

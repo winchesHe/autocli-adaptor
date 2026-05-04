@@ -1,0 +1,438 @@
+site: twitter
+name: user-posts
+description: Fetch Twitter/X posts from a specific user, with optional detail-page expansion and image data capture
+domain: x.com
+tags: [twitter, x, posts, user, media]
+strategy: cookie
+browser: true
+
+args:
+  username:
+    type: str
+    required: true
+    description: Twitter/X username without @
+  limit:
+    type: int
+    default: 20
+    description: Maximum number of posts to return
+  since:
+    type: str
+    default: ""
+    description: Keep posts at or after this date/time, e.g. 2026-05-01
+  until:
+    type: str
+    default: ""
+    description: Keep posts at or before this date/time, e.g. 2026-05-03
+  include-detail:
+    type: str
+    default: "false"
+    description: true/false; open each post detail page to refresh full visible text and media
+  download-media:
+    type: str
+    default: "false"
+    description: true/false; fetch image bytes as data URLs in the JSON output
+  max-scrolls:
+    type: int
+    default: 20
+    description: Maximum profile scroll attempts while looking for matching posts
+
+columns: [rank, id, created_at, author, content, media_count, url]
+
+pipeline:
+  - navigate:
+      url: https://x.com/home
+      settleMs: 3000
+
+  - evaluate: |
+      (() => {
+        const username = String(args.username || '').replace(/^@/, '').trim();
+        if (!username) throw new Error('Missing --username');
+        return username;
+      })()
+
+  - navigate:
+      url: "https://x.com/${{ data }}"
+      settleMs: 5000
+
+  - evaluate: |
+      (async () => {
+        const username = String(args.username || '').replace(/^@/, '').trim();
+        const limit = Math.max(1, Number(args.limit || 20));
+        const maxScrolls = Math.max(1, Number(args['max-scrolls'] || 20));
+        const includeDetail = String(args['include-detail'] || 'false').toLowerCase() === 'true';
+        const downloadMedia = String(args['download-media'] || 'false').toLowerCase() === 'true';
+        const warnings = [];
+
+        const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+        const parseBoundary = (raw, isUntil) => {
+          const value = String(raw || '').trim();
+          if (!value) return null;
+          const normalized = /^\d{4}-\d{2}-\d{2}$/.test(value)
+            ? `${value}T${isUntil ? '23:59:59.999' : '00:00:00.000'}Z`
+            : value;
+          const date = new Date(normalized);
+          if (Number.isNaN(date.getTime())) {
+            warnings.push(`Ignored invalid ${isUntil ? 'until' : 'since'} value: ${value}`);
+            return null;
+          }
+          return date;
+        };
+
+        const since = parseBoundary(args.since, false);
+        const until = parseBoundary(args.until, true);
+
+        const absolutize = (href) => {
+          if (!href) return '';
+          if (href.startsWith('http')) return href;
+          return `https://x.com${href}`;
+        };
+
+        const normalizeImageUrl = (src) => {
+          if (!src || !src.includes('pbs.twimg.com/media')) return '';
+          let next = src.replace(/[?&]name=\w+/, (match) => `${match[0]}name=large`);
+          if (!/[?&]name=/.test(next)) {
+            next += next.includes('?') ? '&name=large' : '?format=jpg&name=large';
+          }
+          return next;
+        };
+
+        const metricValue = (text) => {
+          const raw = String(text || '').replace(/,/g, '').trim();
+          if (!raw) return 0;
+          const match = raw.match(/([\d.]+)\s*([KMB万億亿]?)/i);
+          if (!match) return 0;
+          const n = Number(match[1]);
+          if (!Number.isFinite(n)) return 0;
+          const suffix = match[2].toUpperCase();
+          if (suffix === 'K') return Math.round(n * 1_000);
+          if (suffix === 'M') return Math.round(n * 1_000_000);
+          if (suffix === 'B') return Math.round(n * 1_000_000_000);
+          if (suffix === '万') return Math.round(n * 10_000);
+          if (suffix === '億' || suffix === '亿') return Math.round(n * 100_000_000);
+          return Math.round(n);
+        };
+
+        const extractFromArticle = (article, rankHint) => {
+          const timeEl = article.querySelector('time');
+          const timeStatusHref = timeEl?.closest('a[href*="/status/"]')?.getAttribute('href') || '';
+          const statusLink = timeStatusHref || Array.from(article.querySelectorAll('a[href*="/status/"]'))
+            .map((link) => link.getAttribute('href') || '')
+            .find((href) => /\/status\/\d+/.test(href));
+          const id = (statusLink.match(/\/status\/(\d+)/) || [])[1] || '';
+          if (!id) return null;
+
+          const createdAt = timeEl?.getAttribute('datetime') || '';
+          const postDate = createdAt ? new Date(createdAt) : null;
+          let timeParseStatus = 'ok';
+          if (!createdAt || !postDate || Number.isNaN(postDate.getTime())) {
+            timeParseStatus = 'missing_or_unparseable';
+          }
+
+          if (postDate && !Number.isNaN(postDate.getTime())) {
+            if (since && postDate < since) return null;
+            if (until && postDate > until) return null;
+          }
+
+          const text = Array.from(article.querySelectorAll('div[data-testid="tweetText"]'))
+            .map((el) => el.innerText || el.textContent || '')
+            .join('\n')
+            .trim();
+
+          const authorLink = Array.from(article.querySelectorAll('a[role="link"]'))
+            .map((link) => link.getAttribute('href') || '')
+            .find((href) => /^\/[A-Za-z0-9_]+$/.test(href) && !href.startsWith('/i/'));
+          const author = (authorLink || `/${username}`).replace('/', '');
+
+          const mediaUrls = Array.from(article.querySelectorAll('img[src*="pbs.twimg.com/media"]'))
+            .map((img) => normalizeImageUrl(img.src || img.getAttribute('src') || ''))
+            .filter(Boolean);
+          const uniqueMediaUrls = Array.from(new Set(mediaUrls));
+
+          const analyticsLink = article.querySelector('a[href*="/analytics"]');
+
+          return {
+            rank: rankHint,
+            id,
+            author,
+            created_at: createdAt,
+            time_parse_status: timeParseStatus,
+            text,
+            detail_text: '',
+            url: absolutize(statusLink),
+            media_urls: uniqueMediaUrls,
+            media_count: uniqueMediaUrls.length,
+            local_media_paths: [],
+            media_data_urls: [],
+            metrics: {
+              replies: metricValue(article.querySelector('button[data-testid="reply"]')?.innerText || ''),
+              reposts: metricValue(article.querySelector('button[data-testid="retweet"], button[data-testid="unretweet"]')?.innerText || ''),
+              likes: metricValue(article.querySelector('button[data-testid="like"], button[data-testid="unlike"]')?.innerText || ''),
+              views: metricValue(analyticsLink?.innerText || ''),
+            },
+          };
+        };
+
+        const collectVisiblePosts = () => {
+          const results = [];
+          const seen = new Set();
+          const articles = Array.from(document.querySelectorAll('article[data-testid="tweet"]'));
+          for (const article of articles) {
+            const post = extractFromArticle(article, results.length + 1);
+            if (!post || seen.has(post.id)) continue;
+            seen.add(post.id);
+            results.push(post);
+          }
+          return results;
+        };
+
+        const seen = new Set();
+        const posts = [];
+        let lastHeight = 0;
+        let stagnantScrolls = 0;
+
+        for (let scrollIndex = 0; scrollIndex <= maxScrolls && posts.length < limit; scrollIndex++) {
+          for (const post of collectVisiblePosts()) {
+            if (seen.has(post.id)) continue;
+            seen.add(post.id);
+            post.rank = posts.length + 1;
+            posts.push(post);
+            if (posts.length >= limit) break;
+          }
+
+          if (posts.length >= limit) break;
+          const currentHeight = document.body.scrollHeight;
+          window.scrollTo(0, currentHeight);
+          await sleep(1600);
+          if (document.body.scrollHeight === lastHeight) stagnantScrolls += 1;
+          else stagnantScrolls = 0;
+          lastHeight = document.body.scrollHeight;
+          if (stagnantScrolls >= 3) break;
+        }
+
+        if (!posts.length) {
+          throw new Error('No posts found. Check login state, username, date filters, or X DOM changes.');
+        }
+
+        const fetchImageDataUrl = async (url) => {
+          try {
+            const resp = await fetch(url, { credentials: 'include' });
+            if (!resp.ok) return { url, status: `failed:${resp.status}`, data_url: '' };
+            const blob = await resp.blob();
+            const dataUrl = await new Promise((resolve, reject) => {
+              const reader = new FileReader();
+              reader.onload = () => resolve(String(reader.result || ''));
+              reader.onerror = reject;
+              reader.readAsDataURL(blob);
+            });
+            return { url, status: 'ok', content_type: blob.type || '', size: blob.size || 0, data_url: dataUrl };
+          } catch (error) {
+            return { url, status: `failed:${error?.message || 'unknown'}`, data_url: '' };
+          }
+        };
+
+        const fetchTweetDetail = async (tweetId) => {
+          const bearer = 'AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA';
+          const ct0 = document.cookie.split(';').map((c) => c.trim()).find((c) => c.startsWith('ct0='))?.split('=')[1];
+          if (!ct0) throw new Error('No ct0 cookie - not logged into x.com');
+
+          const resolveQueryId = async (operationName, fallbackId) => {
+            try {
+              const ghResp = await fetch('https://raw.githubusercontent.com/fa0311/twitter-openapi/refs/heads/main/src/config/placeholder.json');
+              if (ghResp.ok) {
+                const placeholder = await ghResp.json();
+                const entry = placeholder[operationName];
+                if (entry && entry.queryId) return entry.queryId;
+              }
+            } catch {}
+            try {
+              const scripts = performance.getEntriesByType('resource')
+                .filter((r) => r.name.includes('client-web') && r.name.endsWith('.js'))
+                .map((r) => r.name);
+              for (const scriptUrl of scripts.slice(0, 15)) {
+                try {
+                  const text = await (await fetch(scriptUrl)).text();
+                  const re = new RegExp(`queryId:"([A-Za-z0-9_-]+)"[^}]{0,200}operationName:"${operationName}"`);
+                  const match = text.match(re);
+                  if (match) return match[1];
+                } catch {}
+              }
+            } catch {}
+            return fallbackId;
+          };
+
+          const variables = {
+            tweetId,
+            withCommunity: true,
+            includePromotedContent: false,
+            withVoice: true,
+          };
+          const features = {
+            creator_subscriptions_tweet_preview_api_enabled: true,
+            freedom_of_speech_not_reach_fetch_enabled: true,
+            longform_notetweets_consumption_enabled: true,
+            longform_notetweets_inline_media_enabled: true,
+            longform_notetweets_rich_text_read_enabled: true,
+            responsive_web_edit_tweet_api_enabled: true,
+            responsive_web_enhance_cards_enabled: false,
+            responsive_web_graphql_exclude_directive_enabled: true,
+            responsive_web_graphql_skip_user_profile_image_extensions_enabled: false,
+            responsive_web_graphql_timeline_navigation_enabled: true,
+            responsive_web_twitter_article_tweet_consumption_enabled: true,
+            standardized_nudges_misinfo: true,
+            tweet_with_visibility_results_prefer_gql_limited_actions_policy_enabled: true,
+            verified_phone_label_enabled: false,
+            view_counts_everywhere_api_enabled: true,
+          };
+          const fieldToggles = {
+            withArticlePlainText: true,
+            withArticleRichContentState: true,
+          };
+
+          const queryId = await resolveQueryId('TweetResultByRestId', '7xflPyRiUxGVbJd4uWmbfg');
+          const apiUrl = `/i/api/graphql/${queryId}/TweetResultByRestId`
+            + `?variables=${encodeURIComponent(JSON.stringify(variables))}`
+            + `&features=${encodeURIComponent(JSON.stringify(features))}`
+            + `&fieldToggles=${encodeURIComponent(JSON.stringify(fieldToggles))}`;
+          const resp = await fetch(apiUrl, {
+            credentials: 'include',
+            headers: {
+              Authorization: `Bearer ${decodeURIComponent(bearer)}`,
+              'X-Csrf-Token': ct0,
+              'X-Twitter-Active-User': 'yes',
+              'X-Twitter-Auth-Type': 'OAuth2Session',
+            },
+          });
+          if (!resp.ok) throw new Error(`TweetResultByRestId HTTP ${resp.status}`);
+
+          const payload = await resp.json();
+          const result = payload.data?.tweetResult?.result;
+          const tweet = result?.tweet || result;
+          if (!tweet) throw new Error('Tweet detail payload missing tweet result');
+
+          const legacy = tweet.legacy || {};
+          const user = tweet.core?.user_results?.result;
+          const screenName = user?.legacy?.screen_name || user?.core?.screen_name || username;
+          const noteText = tweet.note_tweet?.note_tweet_results?.result?.text;
+          const articleResults = tweet.article?.article_results?.result;
+
+          const extractArticleContent = (article) => {
+            if (!article) return null;
+            const contentState = article.content_state || {};
+            const blocks = contentState.blocks || [];
+            const parts = [];
+            let orderedCounter = 0;
+
+            for (const block of blocks) {
+              const blockType = block.type || 'unstyled';
+              if (blockType === 'atomic') continue;
+              const text = block.text || '';
+              if (!text) continue;
+              if (blockType !== 'ordered-list-item') orderedCounter = 0;
+
+              if (blockType === 'header-one') parts.push(`# ${text}`);
+              else if (blockType === 'header-two') parts.push(`## ${text}`);
+              else if (blockType === 'header-three') parts.push(`### ${text}`);
+              else if (blockType === 'blockquote') parts.push(`> ${text}`);
+              else if (blockType === 'unordered-list-item') parts.push(`- ${text}`);
+              else if (blockType === 'ordered-list-item') {
+                orderedCounter += 1;
+                parts.push(`${orderedCounter}. ${text}`);
+              } else if (blockType === 'code-block') {
+                parts.push(`\`\`\`\n${text}\n\`\`\``);
+              } else {
+                parts.push(text);
+              }
+            }
+
+            const content = parts.join('\n\n').trim();
+            if (!content) return null;
+            return {
+              title: article.title || '',
+              content,
+            };
+          };
+
+          const article = extractArticleContent(articleResults);
+          const mediaEntities = [
+            ...(legacy.extended_entities?.media || []),
+            ...(legacy.entities?.media || []),
+          ];
+          const mediaUrls = mediaEntities
+            .map((media) => media.media_url_https || media.media_url || '')
+            .map(normalizeImageUrl)
+            .filter(Boolean);
+
+          return {
+            author: screenName,
+            created_at: legacy.created_at || '',
+            text: noteText || legacy.full_text || '',
+            article_title: article?.title || '',
+            detail_text: article?.content || noteText || legacy.full_text || '',
+            has_article: Boolean(article?.content),
+            media_urls: Array.from(new Set(mediaUrls)),
+            metrics: {
+              replies: legacy.reply_count || 0,
+              reposts: legacy.retweet_count || 0,
+              likes: legacy.favorite_count || 0,
+              views: tweet.views?.count ? Number(tweet.views.count) || 0 : 0,
+            },
+          };
+        };
+
+        if (includeDetail || downloadMedia) {
+          for (const post of posts) {
+            if (!post.id) continue;
+            try {
+              const detail = await fetchTweetDetail(post.id);
+              post.detail_text = detail.detail_text || detail.text || post.text;
+              post.article_title = detail.article_title || '';
+              post.has_article = detail.has_article || false;
+              post.detail_source = detail.has_article ? 'article' : 'tweet';
+              post.author = detail.author || post.author;
+              post.media_urls = Array.from(new Set([...(post.media_urls || []), ...(detail.media_urls || [])]));
+              post.media_count = post.media_urls.length;
+              post.metrics = detail.metrics || post.metrics;
+              post.created_at_detail = detail.created_at || '';
+
+              if (downloadMedia && post.media_urls.length) {
+                const mediaData = [];
+                for (const mediaUrl of post.media_urls) {
+                  mediaData.push(await fetchImageDataUrl(mediaUrl));
+                }
+                post.media_data_urls = mediaData;
+              }
+            } catch (error) {
+              warnings.push(`Detail/media step failed for ${post.url}: ${error?.message || error}`);
+            }
+          }
+        }
+
+        if (downloadMedia) {
+          warnings.push('download-media=true returns image bytes as media_data_urls when browser fetch allows it. For guaranteed local files, pipe JSON to ~/.autocli/adapters/twitter/download-media.py.');
+        }
+
+        return posts.map((post) => {
+          const result = {
+            ...post,
+            requested_username: username,
+            warnings,
+          };
+
+          if (includeDetail || downloadMedia) {
+            result.content = result.detail_text || result.text || '';
+            delete result.text;
+            delete result.detail_text;
+          } else {
+            result.content = result.text || '';
+            delete result.text;
+            delete result.detail_text;
+            delete result.article_title;
+            delete result.has_article;
+            delete result.detail_source;
+            delete result.created_at_detail;
+          }
+
+          return result;
+        });
+      })()
