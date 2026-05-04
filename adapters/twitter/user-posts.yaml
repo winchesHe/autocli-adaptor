@@ -34,7 +34,11 @@ args:
   max-scrolls:
     type: int
     default: 20
-    description: Maximum profile scroll attempts while looking for matching posts
+    description: Maximum profile scroll attempts while looking for matching posts (DOM 路径已废弃，此参数保留兼容)
+  rate-limit-ms:
+    type: int
+    default: 1200
+    description: 翻页之间最小间隔毫秒，避免触发 X 429 限流；设为 0 关闭
 
 columns: [rank, id, created_at, author, content, media_count, url]
 
@@ -113,80 +117,7 @@ pipeline:
           return Math.round(n);
         };
 
-        const extractFromArticle = (article, rankHint) => {
-          const timeEl = article.querySelector('time');
-          const timeStatusHref = timeEl?.closest('a[href*="/status/"]')?.getAttribute('href') || '';
-          const statusLink = timeStatusHref || Array.from(article.querySelectorAll('a[href*="/status/"]'))
-            .map((link) => link.getAttribute('href') || '')
-            .find((href) => /\/status\/\d+/.test(href));
-          const id = (statusLink.match(/\/status\/(\d+)/) || [])[1] || '';
-          if (!id) return null;
-
-          const createdAt = timeEl?.getAttribute('datetime') || '';
-          const postDate = createdAt ? new Date(createdAt) : null;
-          let timeParseStatus = 'ok';
-          if (!createdAt || !postDate || Number.isNaN(postDate.getTime())) {
-            timeParseStatus = 'missing_or_unparseable';
-          }
-
-          if (postDate && !Number.isNaN(postDate.getTime())) {
-            if (since && postDate < since) return null;
-            if (until && postDate > until) return null;
-          }
-
-          const text = Array.from(article.querySelectorAll('div[data-testid="tweetText"]'))
-            .map((el) => el.innerText || el.textContent || '')
-            .join('\n')
-            .trim();
-
-          const authorLink = Array.from(article.querySelectorAll('a[role="link"]'))
-            .map((link) => link.getAttribute('href') || '')
-            .find((href) => /^\/[A-Za-z0-9_]+$/.test(href) && !href.startsWith('/i/'));
-          const author = (authorLink || `/${username}`).replace('/', '');
-
-          const mediaUrls = Array.from(article.querySelectorAll('img[src*="pbs.twimg.com/media"]'))
-            .map((img) => normalizeImageUrl(img.src || img.getAttribute('src') || ''))
-            .filter(Boolean);
-          const uniqueMediaUrls = Array.from(new Set(mediaUrls));
-
-          const analyticsLink = article.querySelector('a[href*="/analytics"]');
-
-          return {
-            rank: rankHint,
-            id,
-            author,
-            created_at: createdAt,
-            time_parse_status: timeParseStatus,
-            text,
-            detail_text: '',
-            url: absolutize(statusLink),
-            media_urls: uniqueMediaUrls,
-            media_count: uniqueMediaUrls.length,
-            local_media_paths: [],
-            media_data_urls: [],
-            metrics: {
-              replies: metricValue(article.querySelector('button[data-testid="reply"]')?.innerText || ''),
-              reposts: metricValue(article.querySelector('button[data-testid="retweet"], button[data-testid="unretweet"]')?.innerText || ''),
-              likes: metricValue(article.querySelector('button[data-testid="like"], button[data-testid="unlike"]')?.innerText || ''),
-              views: metricValue(analyticsLink?.innerText || ''),
-            },
-          };
-        };
-
-        const collectVisiblePosts = () => {
-          const results = [];
-          const seen = new Set();
-          const articles = Array.from(document.querySelectorAll('article[data-testid="tweet"]'));
-          for (const article of articles) {
-            const post = extractFromArticle(article, results.length + 1);
-            if (!post || seen.has(post.id)) continue;
-            seen.add(post.id);
-            results.push(post);
-          }
-          return results;
-        };
-
-        // ─── GQL 路径：UserByScreenName → UserTweets，绕开 DOM 滚动 ───
+        // ─── GQL 路径：UserByScreenName → UserTweets，严格模式（DOM 滚动兜底已移除） ───
         const bearer = 'AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA';
         const ct0 = document.cookie.split(';').map((c) => c.trim()).find((c) => c.startsWith('ct0='))?.split('=')[1];
 
@@ -330,9 +261,15 @@ pipeline:
             responsive_web_enhance_cards_enabled: false,
           };
 
+          // GQL 节流：UserTweets 翻页之间至少间隔 RATE_LIMIT_MS，
+          // 避免短时高频请求触发 X 的 429（X web GQL 大致 ~150 req / 15min，
+          // 但短时窗口阈值更严，1.2s 间隔可以稳住分页场景）
+          const rateLimitMs = Math.max(0, Number(args['rate-limit-ms'] || 1200));
+
           const collected = [];
           let cursor = '';
           for (let page = 0; page < 8 && collected.length < want; page++) {
+            if (page > 0 && rateLimitMs > 0) await sleep(rateLimitMs);
             const variables = {
               userId: restId,
               count: Math.min(40, Math.max(20, want - collected.length + 5)),
@@ -412,85 +349,10 @@ pipeline:
           return filtered;
         };
 
-        let posts = [];
-        let usedPath = 'gql';
-        try {
-          posts = await fetchUserTimelineGql(username, limit);
-        } catch (error) {
-          warnings.push(`gql_path_failed: ${error?.message || error}; falling back to scroll`);
-          usedPath = 'scroll';
-        }
-
-        // 兜底：GQL 失败或返回 0 → 走原 DOM 滚动路径
-        const seen = new Set(posts.map((p) => p.id));
-        let lastHeight = 0;
-        let stagnantScrolls = 0;
-        const verbose = Boolean(args.verbose);
-
-        const harvest = () => {
-          for (const post of collectVisiblePosts()) {
-            if (seen.has(post.id)) continue;
-            seen.add(post.id);
-            post.rank = posts.length + 1;
-            posts.push(post);
-            if (posts.length >= limit) return true;
-          }
-          return false;
-        };
-
-        if (posts.length === 0) {
-          usedPath = 'scroll';
-          // 先把视口拉回顶部并采一次，避免初始位置丢掉头部 post
-          window.scrollTo(0, 0);
-          await sleep(400);
-          harvest();
-        }
-
-        for (let scrollIndex = 0; usedPath === 'scroll' && scrollIndex <= maxScrolls && posts.length < limit; scrollIndex++) {
-          // 每 3 次 scrollBy 做一次到底（触发 X 懒加载），其余小步滚（避免虚拟列表跳过中间 post）
-          if (scrollIndex % 3 === 2) {
-            window.scrollTo(0, document.body.scrollHeight);
-            await sleep(1100);
-          } else {
-            const step = Math.max(400, Math.floor(window.innerHeight * 0.8));
-            window.scrollBy(0, step);
-            await sleep(900);
-          }
-          if (harvest()) break;
-
-          const currentHeight = document.body.scrollHeight;
-          const currentScrollY = window.scrollY + window.innerHeight;
-          // height 没涨且已经接近底部 → 真停滞
-          if (currentHeight === lastHeight && currentScrollY >= currentHeight - 300) {
-            stagnantScrolls += 1;
-          } else {
-            stagnantScrolls = 0;
-          }
-          lastHeight = currentHeight;
-          if (verbose) {
-            console.log(`[user-posts] scroll=${scrollIndex} posts=${posts.length} height=${currentHeight} stagnant=${stagnantScrolls}`);
-          }
-          if (stagnantScrolls >= 4) break;
-        }
-
-        // ─── 诊断：捕获 autocli Chrome 看到的页面状态，注入第一条 post 的 warnings ───
-        const diag = {
-          url: location.href,
-          title: document.title,
-          scroll_height_final: document.body.scrollHeight,
-          articles_in_dom: document.querySelectorAll('article[data-testid="tweet"]').length,
-          has_ct0_cookie: /(?:^|;\s*)ct0=/.test(document.cookie || ''),
-          login_link: !!document.querySelector('a[href="/login"], a[data-testid="loginButton"]'),
-          signup_button: !!document.querySelector('a[data-testid="signupButton"]'),
-          rate_limit_text: (document.body.innerText.match(/(rate.?limit|temporarily.?limited|too many requests|something went wrong)/i) || [])[0] || '',
-          empty_state: !!document.querySelector('div[data-testid="emptyState"]'),
-          retry_button: !!document.querySelector('button[role="button"][data-testid="retry"]'),
-          show_more_replies: !!document.querySelector('a[href*="show_more_replies"]'),
-        };
-        warnings.push(`diag=${JSON.stringify(diag)}`);
-
+        // GQL 严格路径：失败直接抛错，不回退 DOM 滚动（避免 429 后继续打 X）
+        const posts = await fetchUserTimelineGql(username, limit);
         if (!posts.length) {
-          throw new Error(`No posts found. diag=${JSON.stringify(diag)}`);
+          throw new Error(`UserTweets returned 0 posts for ${username}`);
         }
 
         const fetchImageDataUrl = async (url) => {

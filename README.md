@@ -113,33 +113,54 @@ const gqlGet = async (operationName, queryId, variables, features, fieldToggles)
 
 时间字段 `legacy.created_at` 是 `Sun May 04 13:39:49 +0000 2026` 风格，`new Date(s).toISOString()` 即可标准化。
 
-### 双路径混合（推荐 adapter 默认形态）
+### 严格 GQL（推荐 adapter 默认形态）
+
+不要在 GQL 失败时回退 DOM 滚动。一旦被 X 限流（429）：
+- DOM 滚动只会让 Chrome 继续向 X 发请求，**加剧限流**，把短时限流变成长时限流。
+- 调用方拿到一份"用 DOM 兜底但残缺"的结果，容易误以为同步成功，让中间漏的 post 永远补不上。
+
+正确做法：GQL 失败直接抛错，由调用方决定退出还是延后重试：
 
 ```js
-let posts = [];
-let usedPath = 'gql';
-try {
-  posts = await fetchUserTimelineGql(username, limit);
-} catch (error) {
-  warnings.push(`gql_path_failed: ${error?.message || error}; falling back to scroll`);
-  usedPath = 'scroll';
+const posts = await fetchUserTimelineGql(username, limit);
+if (!posts.length) {
+  throw new Error(`UserTweets returned 0 posts for ${username}`);
 }
-if (posts.length === 0) { usedPath = 'scroll'; /* DOM 滚动逻辑 */ }
 ```
 
-调用方通过 `warnings[]` 里有没有 `gql_path_failed:` 就能知道走的哪条。
+`twitter/user-posts.yaml` 已删除 DOM 滚动路径和相关 `extractFromArticle` / `collectVisiblePosts` helpers。
+
+### GQL 节流（必做）
+
+X web GQL 在短时间窗口内会触发 429，恢复时间从几分钟到几十分钟不等。adapter 内部需要在翻页之间加最小间隔；外层批量脚本需要在用户间也加间隔。
+
+**adapter 内部**（cursor 分页）：
+
+```js
+const rateLimitMs = Math.max(0, Number(args['rate-limit-ms'] || 1200));
+for (let page = 0; page < maxPages; page++) {
+  if (page > 0 && rateLimitMs > 0) await sleep(rateLimitMs);
+  // gqlGet UserTweets ...
+}
+```
+
+**外层批量脚本**：
+- 用户间至少 sleep 1-2 秒
+- 检测到 stderr 含 `HTTP 429` 立刻中止后续，不要继续打 X
+- 失败别立刻重试，先冷却 5-15 分钟
 
 ---
 
-## DOM 滚动调优要点（兜底路径）
+## DOM 滚动调优要点（仅供新接入站点参考）
 
-仅当目标站点没有可用 GQL，或本地 ct0 不可用时使用。原则：
+> Twitter/X adapter 已**不再使用** DOM 滚动——GQL 严格模式优先，失败抛错。下面是新接入其它站点时如果只能走 DOM 路径的调优要点：
 
 - **小步滚动**：`window.scrollBy(0, innerHeight*0.8)`，避免跳到底导致虚拟列表漏渲染。
 - **周期到底触发懒加载**：每 N 步做一次 `window.scrollTo(0, scrollHeight)`。
-- **多次 harvest**：滚后立刻采一次，再延迟 500-800ms 二采（X 经常分两批渲染）。
+- **多次 harvest**：滚后立刻采一次，再延迟 500-800ms 二采。
 - **stagnant 阈值**：`scrollHeight` 不增 + `scrollY+innerHeight ≥ scrollHeight - 300` 才算真停滞，连续 4-6 次再退出。
 - **总耗时控制在 daemon 单次 evaluate 超时（~30s）以内**：sleep 别叠加超过 25s，否则触发 cli 重试 + 总 60s 超时。
+- **不要把 DOM 滚动当做 GQL 的"自动兜底"**：429 / 限流场景下 DOM 抓取本身也会打站点接口，反而加剧限流。
 
 ---
 
