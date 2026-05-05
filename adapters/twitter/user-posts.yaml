@@ -1,16 +1,20 @@
 site: twitter
 name: user-posts
-description: Fetch Twitter/X posts from a specific user, with optional detail-page expansion and image data capture
+description: Fetch Twitter/X posts via GQL (UserByScreenName + UserTweets). Single-user with --username, or batch with --usernames "h1,h2,..." (one navigate, N GQL).
 domain: x.com
-tags: [twitter, x, posts, user, media]
+tags: [twitter, x, posts, user, media, gql]
 strategy: cookie
 browser: true
 
 args:
   username:
     type: str
-    required: true
-    description: Twitter/X username without @
+    required: false
+    description: Twitter/X username without @ (single-user mode)
+  usernames:
+    type: str
+    default: ""
+    description: 批量模式：comma-separated handles (e.g. "alice,bob,carol")。提供时优先于 username，整批共享一次 navigate
   limit:
     type: int
     default: 20
@@ -31,40 +35,36 @@ args:
     type: str
     default: "false"
     description: true/false; fetch image bytes as data URLs in the JSON output
-  max-scrolls:
-    type: int
-    default: 20
-    description: Maximum profile scroll attempts while looking for matching posts (DOM 路径已废弃，此参数保留兼容)
   rate-limit-ms:
     type: int
     default: 1200
     description: 翻页之间最小间隔毫秒，避免触发 X 429 限流；设为 0 关闭
+  inter-user-ms:
+    type: int
+    default: 1500
+    description: 批量模式（--usernames）下用户之间间隔毫秒，节流防 429；设为 0 关闭
 
 columns: [rank, id, created_at, author, content, media_count, url]
 
 pipeline:
+  # 一次 navigate：让 Chrome tab 落在 x.com，刷新 ct0 + 建立 same-origin。
+  # evaluate 内部用 --usernames 批量循环时，所有 handle 共享这次 navigate（cookies 只刷一次）。
   - navigate:
       url: https://x.com/home
       settleMs: 3000
 
   - evaluate: |
-      (() => {
-        const username = String(args.username || '').replace(/^@/, '').trim();
-        if (!username) throw new Error('Missing --username');
-        return username;
-      })()
-
-  - navigate:
-      url: "https://x.com/${{ data }}"
-      settleMs: 5000
-
-  - evaluate: |
       (async () => {
         const username = String(args.username || '').replace(/^@/, '').trim();
+        const usernamesRaw = String(args.usernames || '').trim();
+        const handles = usernamesRaw
+          ? usernamesRaw.split(',').map(s => s.replace(/^@/, '').trim()).filter(Boolean)
+          : (username ? [username] : []);
+        if (!handles.length) throw new Error('Missing --username or --usernames');
         const limit = Math.max(1, Number(args.limit || 20));
-        const maxScrolls = Math.max(1, Number(args['max-scrolls'] || 20));
         const includeDetail = String(args['include-detail'] || 'false').toLowerCase() === 'true';
         const downloadMedia = String(args['download-media'] || 'false').toLowerCase() === 'true';
+        const interUserMs = Math.max(0, Number(args['inter-user-ms'] || 1500));
         const warnings = [];
 
         const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -173,14 +173,14 @@ pipeline:
           return d.toISOString();
         };
 
-        const tweetToPost = (result, rankHint) => {
+        const tweetToPost = (result, rankHint, ownerHandle) => {
           const tweet = result?.tweet || result;
           if (!tweet) return null;
           const legacy = tweet.legacy || {};
           const id = tweet.rest_id || legacy.id_str || '';
           if (!id) return null;
           const user = tweet.core?.user_results?.result;
-          const screenName = user?.legacy?.screen_name || user?.core?.screen_name || username;
+          const screenName = user?.legacy?.screen_name || user?.core?.screen_name || ownerHandle;
           const noteText = tweet.note_tweet?.note_tweet_results?.result?.text;
           const createdAtIso = parseTwitterDate(legacy.created_at);
           const mediaEntities = [
@@ -296,7 +296,7 @@ pipeline:
                 if (eid.startsWith('tweet-')) {
                   const result = entry.content?.itemContent?.tweet_results?.result;
                   if (result) {
-                    const post = tweetToPost(result, collected.length + 1);
+                    const post = tweetToPost(result, collected.length + 1, handle);
                     if (post && post.created_at) {
                       const d = new Date(post.created_at);
                       if (since && d < since) { /* 旧帖：仍收集到 collected，是否过滤交给后面 */ }
@@ -313,7 +313,7 @@ pipeline:
                   for (const item of items) {
                     const result = item.item?.itemContent?.tweet_results?.result;
                     if (!result) continue;
-                    const post = tweetToPost(result, collected.length + 1);
+                    const post = tweetToPost(result, collected.length + 1, handle);
                     if (post) {
                       collected.push(post);
                       pageHadTweet = true;
@@ -349,10 +349,29 @@ pipeline:
           return filtered;
         };
 
-        // GQL 严格路径：失败直接抛错，不回退 DOM 滚动（避免 429 后继续打 X）
-        const posts = await fetchUserTimelineGql(username, limit);
+        // GQL 严格路径：批量遍历 handles，每用户一次 fetchUserTimelineGql；
+        // 单个用户失败不影响批次，记入 warnings；全部 0 条才抛错。
+        const posts = [];
+        let firstErr = null;
+        for (let i = 0; i < handles.length; i++) {
+          if (i > 0 && interUserMs > 0) await sleep(interUserMs);
+          const handle = handles[i];
+          try {
+            const userPosts = await fetchUserTimelineGql(handle, limit);
+            userPosts.forEach((p) => { p.requested_username = handle; });
+            posts.push(...userPosts);
+          } catch (e) {
+            const msg = `fetch failed for ${handle}: ${e?.message || e}`;
+            warnings.push(msg);
+            if (!firstErr) firstErr = e;
+            // 命中 429 → 直接抛，避免持续打 X
+            if (String(e?.message || '').includes('HTTP 429')) {
+              throw new Error(`Hit 429 on ${handle}; aborting batch. ${msg}`);
+            }
+          }
+        }
         if (!posts.length) {
-          throw new Error(`UserTweets returned 0 posts for ${username}`);
+          throw firstErr || new Error(`UserTweets returned 0 posts for handles=${handles.join(',')}`);
         }
 
         const fetchImageDataUrl = async (url) => {
@@ -453,7 +472,7 @@ pipeline:
 
           const legacy = tweet.legacy || {};
           const user = tweet.core?.user_results?.result;
-          const screenName = user?.legacy?.screen_name || user?.core?.screen_name || username;
+          const screenName = user?.legacy?.screen_name || user?.core?.screen_name || handles[0] || '';
           const noteText = tweet.note_tweet?.note_tweet_results?.result?.text;
           const articleResults = tweet.article?.article_results?.result;
 
@@ -554,9 +573,10 @@ pipeline:
         }
 
         return posts.map((post) => {
+          // requested_username 已在批量循环里写入，单用户 fallback 用 handles[0]
           const result = {
             ...post,
-            requested_username: username,
+            requested_username: post.requested_username || handles[0],
             warnings,
           };
 

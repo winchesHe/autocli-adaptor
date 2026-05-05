@@ -149,6 +149,48 @@ for (let page = 0; page < maxPages; page++) {
 - 检测到 stderr 含 `HTTP 429` 立刻中止后续，不要继续打 X
 - 失败别立刻重试，先冷却 5-15 分钟
 
+### 批量复用（一次 navigate 服务多用户/多目标）
+
+批量场景里每个目标都重 navigate `/home` 是浪费——cookies 几小时才过期。推荐 adapter **直接接受批量参数**，在一次 evaluate 内部循环跑 GQL：
+
+```yaml
+args:
+  username:
+    description: 单个 handle（单目标模式）
+  usernames:
+    type: str
+    default: ""
+    description: comma-separated handles（批量；提供时优先于 username）
+
+pipeline:
+  - navigate:                      # 单次 navigate，整批共享
+      url: https://x.com/home
+      settleMs: 3000
+  - evaluate: |
+      (async () => {
+        const handles = String(args.usernames || '').split(',').map(s => s.trim()).filter(Boolean);
+        const targets = handles.length ? handles : [args.username];
+        const interUserMs = Number(args['inter-user-ms'] || 1500);
+        const all = [];
+        for (let i = 0; i < targets.length; i++) {
+          if (i > 0 && interUserMs > 0) await sleep(interUserMs);
+          try {
+            const posts = await fetchTimelineGql(targets[i]);
+            posts.forEach(p => p.requested_username = targets[i]);
+            all.push(...posts);
+          } catch (e) {
+            warnings.push(`fetch failed for ${targets[i]}: ${e.message}`);
+            if (String(e.message).includes('HTTP 429')) throw e;  // 整批退出
+          }
+        }
+        return all;
+      })()
+```
+
+外层脚本一次调用拿到带 `requested_username` 标签的混合数组，按 handle 切分各自做后续处理（cache / 落盘 / 渲染）。参考实现 [stock-infos/scripts/fetch_all_v2.sh](../Desktop/Company/person/skills/stock-infos/scripts/fetch_all_v2.sh) + [_process_user.sh](../Desktop/Company/person/skills/stock-infos/scripts/_process_user.sh)。
+
+> 早期方案是拆"cold（含 navigate）+ fast（无 navigate）" 两个 adapter，靠外层 warm-file 调度。复杂、状态多。改成"adapter 内批量循环"后维护一个 adapter 即可，且更稳。
+
 ---
 
 ## DOM 滚动调优要点（仅供新接入站点参考）
