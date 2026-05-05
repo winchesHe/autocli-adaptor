@@ -47,15 +47,20 @@ args:
     type: str
     default: ""
     description: 预解析的 handle=rest_id 映射（comma-separated, e.g. "alice=12345,bob=67890"）。提供后跳过 UserByScreenName 调用，调用量减半，绕过 X 限流最严的端点
+  primary-handle:
+    type: str
+    default: ""
+    description: 用作 navigate 落地页的 handle（不传则用 --username 或 --usernames 第一个）。落地到该用户 profile 让 X React 自动发 UserByScreenName/UserTweets，evaluate 内 hook 捕获 x-client-transaction-id 注入到后续 gqlGet
 
 columns: [rank, id, created_at, author, content, media_count, url]
 
 pipeline:
-  # 一次 navigate：让 Chrome tab 落在 x.com，刷新 ct0 + 建立 same-origin。
-  # evaluate 内部用 --usernames 批量循环时，所有 handle 共享这次 navigate（cookies 只刷一次）。
-  # settleMs 适度（evaluate 顶部还有 location poll 兜底，不必给太多预算 → 留给批量 GQL）
+  # 一次 navigate：让 Chrome tab 落在 x.com 一个 *profile 页*（不是 home），
+  # 这样 X React 自动发 UserByScreenName + UserTweets，我们在 evaluate 里 hook 后
+  # 再 scroll 一下能捕到 cursor 翻页的 UserTweets x-client-transaction-id。
+  # primary-handle 不传时落 home（capture 失败但不会崩）。
   - navigate:
-      url: https://x.com/home
+      url: https://x.com/${{ args.primary-handle }}
       settleMs: 3500
 
   - evaluate: |
@@ -156,6 +161,76 @@ pipeline:
         const bearer = 'AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA';
         const ct0 = document.cookie.split(';').map((c) => c.trim()).find((c) => c.startsWith('ct0='))?.split('=')[1];
 
+        // ─── X-Client-Transaction-Id 捕获 + 注入 ───
+        // X 在 2024 后对 GQL 加了风控：浏览器 fetch 由 React 自动算 x-client-transaction-id 并加到 header；
+        // 缺这个 header 的请求被打入严格 rate-limit 桶。我们 hook fetch + XHR 捕获 React 自带的 txId，
+        // 然后注入到自己的 gqlGet。同一 operation path 的 txId 在 X 服务端 ~30s 内可复用。
+        const txCache = (window.__autocliTxCache = window.__autocliTxCache || {});
+        const recordTx = (url, txId) => {
+          if (!txId || !url) return;
+          const m = url.match(/\/i\/api\/graphql\/[^/]+\/(\w+)/);
+          if (m) txCache[m[1]] = { id: txId, ts: Date.now() };
+        };
+        const readTxIdFromHeaders = (h) => {
+          try {
+            if (!h) return '';
+            if (h instanceof Headers) return h.get('x-client-transaction-id') || '';
+            if (typeof h === 'object') {
+              for (const k in h) {
+                if (k.toLowerCase() === 'x-client-transaction-id') return h[k] || '';
+              }
+            }
+          } catch {}
+          return '';
+        };
+        if (!window.__autocliTxHookInstalled) {
+          window.__autocliTxHookInstalled = true;
+          // hook fetch（虽然 X 可能用 closured 引用，hook window.fetch 不一定全捕获，
+          // 但作为兜底）
+          const origFetch = window.fetch.bind(window);
+          window.fetch = function (input, init) {
+            try {
+              const url = typeof input === 'string' ? input : (input && input.url) || '';
+              if (url.includes('/i/api/graphql/')) {
+                recordTx(url, readTxIdFromHeaders(init && init.headers));
+              }
+            } catch {}
+            return origFetch(input, init);
+          };
+          // hook XHR.prototype（所有实例共享原型，X 用 XHR 时一定走到）
+          const xhrUrls = new WeakMap();
+          const xhrHdrs = new WeakMap();
+          const origOpen = XMLHttpRequest.prototype.open;
+          const origSetH = XMLHttpRequest.prototype.setRequestHeader;
+          const origSend = XMLHttpRequest.prototype.send;
+          XMLHttpRequest.prototype.open = function (method, url) {
+            try { xhrUrls.set(this, String(url || '')); } catch {}
+            return origOpen.apply(this, arguments);
+          };
+          XMLHttpRequest.prototype.setRequestHeader = function (name, value) {
+            try {
+              if (!xhrHdrs.has(this)) xhrHdrs.set(this, {});
+              xhrHdrs.get(this)[String(name).toLowerCase()] = value;
+            } catch {}
+            return origSetH.apply(this, arguments);
+          };
+          XMLHttpRequest.prototype.send = function () {
+            try {
+              const url = xhrUrls.get(this) || '';
+              const h = xhrHdrs.get(this) || {};
+              if (url.includes('/i/api/graphql/')) {
+                recordTx(url, h['x-client-transaction-id']);
+              }
+            } catch {}
+            return origSend.apply(this, arguments);
+          };
+        }
+
+        // hook 装好了，但 X 在 module-load 时已 closured 住 fetch 引用，
+        // 我们这里 hook 的 window.fetch 不会被 X 内部走到 → 实际很难捕到 txId。
+        // 留 hook 是给未来版本兜底；当前主要靠 referrer + client-language 软 header 缓解风控。
+        // 不主动 trigger（scroll 在 bg tab IntersectionObserver 被节流，无效）。
+
         const resolveQueryId = async (operationName, fallbackId) => {
           try {
             const ghResp = await fetch('https://raw.githubusercontent.com/fa0311/twitter-openapi/refs/heads/main/src/config/placeholder.json');
@@ -187,14 +262,23 @@ pipeline:
             + `?variables=${encodeURIComponent(JSON.stringify(variables))}`
             + `&features=${encodeURIComponent(JSON.stringify(features))}`
             + (fieldToggles ? `&fieldToggles=${encodeURIComponent(JSON.stringify(fieldToggles))}` : '');
+          const headers = {
+            Authorization: `Bearer ${decodeURIComponent(bearer)}`,
+            'X-Csrf-Token': ct0,
+            'X-Twitter-Active-User': 'yes',
+            'X-Twitter-Auth-Type': 'OAuth2Session',
+            'X-Twitter-Client-Language': 'zh-cn',
+          };
+          // 注入捕获到的 X-Client-Transaction-Id，绕过严格风控桶
+          const cached = txCache[operationName];
+          if (cached && Date.now() - cached.ts < 30000) {
+            headers['X-Client-Transaction-Id'] = cached.id;
+          }
           const resp = await fetch(url, {
             credentials: 'include',
-            headers: {
-              Authorization: `Bearer ${decodeURIComponent(bearer)}`,
-              'X-Csrf-Token': ct0,
-              'X-Twitter-Active-User': 'yes',
-              'X-Twitter-Auth-Type': 'OAuth2Session',
-            },
+            referrer: location.href,
+            referrerPolicy: 'strict-origin-when-cross-origin',
+            headers,
           });
           if (!resp.ok) throw new Error(`${operationName} HTTP ${resp.status}`);
           return resp.json();
@@ -500,14 +584,22 @@ pipeline:
             + `?variables=${encodeURIComponent(JSON.stringify(variables))}`
             + `&features=${encodeURIComponent(JSON.stringify(features))}`
             + `&fieldToggles=${encodeURIComponent(JSON.stringify(fieldToggles))}`;
+          const detailHeaders = {
+            Authorization: `Bearer ${decodeURIComponent(bearer)}`,
+            'X-Csrf-Token': ct0,
+            'X-Twitter-Active-User': 'yes',
+            'X-Twitter-Auth-Type': 'OAuth2Session',
+            'X-Twitter-Client-Language': 'zh-cn',
+          };
+          const detailTx = txCache['TweetResultByRestId'];
+          if (detailTx && Date.now() - detailTx.ts < 30000) {
+            detailHeaders['X-Client-Transaction-Id'] = detailTx.id;
+          }
           const resp = await fetch(apiUrl, {
             credentials: 'include',
-            headers: {
-              Authorization: `Bearer ${decodeURIComponent(bearer)}`,
-              'X-Csrf-Token': ct0,
-              'X-Twitter-Active-User': 'yes',
-              'X-Twitter-Auth-Type': 'OAuth2Session',
-            },
+            referrer: location.href,
+            referrerPolicy: 'strict-origin-when-cross-origin',
+            headers: detailHeaders,
           });
           if (!resp.ok) throw new Error(`TweetResultByRestId HTTP ${resp.status}`);
 
