@@ -38,20 +38,25 @@ args:
   rate-limit-ms:
     type: int
     default: 1200
-    description: 翻页之间最小间隔毫秒，避免触发 X 429 限流；设为 0 关闭
+    description: 翻页之间最小间隔毫秒（实际再加 0-30% 随机抖动），避免触发 X 429；设为 0 关闭
   inter-user-ms:
     type: int
     default: 1500
-    description: 批量模式（--usernames）下用户之间间隔毫秒，节流防 429；设为 0 关闭
+    description: 批量模式（--usernames）下用户之间间隔毫秒（实际再加 0-50% 随机抖动），节流防 429；设为 0 关闭
+  user-ids:
+    type: str
+    default: ""
+    description: 预解析的 handle=rest_id 映射（comma-separated, e.g. "alice=12345,bob=67890"）。提供后跳过 UserByScreenName 调用，调用量减半，绕过 X 限流最严的端点
 
 columns: [rank, id, created_at, author, content, media_count, url]
 
 pipeline:
   # 一次 navigate：让 Chrome tab 落在 x.com，刷新 ct0 + 建立 same-origin。
   # evaluate 内部用 --usernames 批量循环时，所有 handle 共享这次 navigate（cookies 只刷一次）。
+  # settleMs 适度（evaluate 顶部还有 location poll 兜底，不必给太多预算 → 留给批量 GQL）
   - navigate:
       url: https://x.com/home
-      settleMs: 3000
+      settleMs: 3500
 
   - evaluate: |
       (async () => {
@@ -67,7 +72,37 @@ pipeline:
         const interUserMs = Math.max(0, Number(args['inter-user-ms'] || 1500));
         const warnings = [];
 
+        // 预解析的 handle → rest_id 映射；命中即跳过 UserByScreenName
+        const knownIds = {};
+        const userIdsRaw = String(args['user-ids'] || '').trim();
+        if (userIdsRaw) {
+          for (const pair of userIdsRaw.split(',')) {
+            const eq = pair.indexOf('=');
+            if (eq <= 0) continue;
+            const h = pair.slice(0, eq).trim().replace(/^@/, '');
+            const id = pair.slice(eq + 1).trim();
+            if (h && id) knownIds[h] = id;
+          }
+        }
+
         const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+        // 防御：等 location 变成 http(s) 且是 x.com 后再访问 document.cookie。
+        // navigate 步骤 settleMs 偶尔不够（about:blank 残留 / 慢网），
+        // 这里再 poll 最长 8s，避免 SecurityError。
+        {
+          let waited = 0;
+          while (waited < 8000) {
+            const onHttp = location.protocol === 'http:' || location.protocol === 'https:';
+            const onXcom = /(^|\.)x\.com$|(^|\.)twitter\.com$/.test(location.hostname);
+            if (onHttp && onXcom) break;
+            await sleep(300);
+            waited += 300;
+          }
+          if (!/(^|\.)x\.com$|(^|\.)twitter\.com$/.test(location.hostname)) {
+            throw new Error(`Tab not on x.com after navigate+wait (location.href=${location.href}). Open https://x.com manually in Chrome and retry.`);
+          }
+        }
 
         const parseBoundary = (raw, isUntil) => {
           const value = String(raw || '').trim();
@@ -214,24 +249,29 @@ pipeline:
         };
 
         const fetchUserTimelineGql = async (handle, want) => {
-          // 1. 解析 rest_id
-          const userVars = { screen_name: handle, withSafetyModeUserFields: true };
-          const userFeatures = {
-            hidden_profile_likes_enabled: true,
-            hidden_profile_subscriptions_enabled: true,
-            responsive_web_graphql_exclude_directive_enabled: true,
-            verified_phone_label_enabled: false,
-            subscriptions_verification_info_is_identity_verified_enabled: true,
-            subscriptions_verification_info_verified_since_enabled: true,
-            highlights_tweets_tab_ui_enabled: true,
-            creator_subscriptions_tweet_preview_api_enabled: true,
-            responsive_web_graphql_skip_user_profile_image_extensions_enabled: false,
-            responsive_web_graphql_timeline_navigation_enabled: true,
-          };
-          const userQueryId = await resolveQueryId('UserByScreenName', 'G3KGOASz96M-Qu0nwmGXNg');
-          const userJson = await gqlGet('UserByScreenName', userQueryId, userVars, userFeatures, { withAuxiliaryUserLabels: false });
-          const restId = userJson?.data?.user?.result?.rest_id;
-          if (!restId) throw new Error(`UserByScreenName returned no rest_id for ${handle}`);
+          // 1. 解析 rest_id —— 优先用调用方传入的缓存值，省掉 UserByScreenName 调用
+          let restId = knownIds[handle];
+          if (!restId) {
+            const userVars = { screen_name: handle, withSafetyModeUserFields: true };
+            const userFeatures = {
+              hidden_profile_likes_enabled: true,
+              hidden_profile_subscriptions_enabled: true,
+              responsive_web_graphql_exclude_directive_enabled: true,
+              verified_phone_label_enabled: false,
+              subscriptions_verification_info_is_identity_verified_enabled: true,
+              subscriptions_verification_info_verified_since_enabled: true,
+              highlights_tweets_tab_ui_enabled: true,
+              creator_subscriptions_tweet_preview_api_enabled: true,
+              responsive_web_graphql_skip_user_profile_image_extensions_enabled: false,
+              responsive_web_graphql_timeline_navigation_enabled: true,
+            };
+            const userQueryId = await resolveQueryId('UserByScreenName', 'G3KGOASz96M-Qu0nwmGXNg');
+            const userJson = await gqlGet('UserByScreenName', userQueryId, userVars, userFeatures, { withAuxiliaryUserLabels: false });
+            restId = userJson?.data?.user?.result?.rest_id;
+            if (!restId) throw new Error(`UserByScreenName returned no rest_id for ${handle}`);
+            // 解析后短暂随机间隔，避免和后续 UserTweets 完全连贯
+            await sleep(300 + Math.floor(Math.random() * 500));
+          }
 
           // 2. 分页拉 UserTweets
           const tweetsQueryId = await resolveQueryId('UserTweets', 'V7H0Ap3_Hh2FyS75OCDO3Q');
@@ -269,7 +309,10 @@ pipeline:
           const collected = [];
           let cursor = '';
           for (let page = 0; page < 8 && collected.length < want; page++) {
-            if (page > 0 && rateLimitMs > 0) await sleep(rateLimitMs);
+            if (page > 0 && rateLimitMs > 0) {
+              const jittered = rateLimitMs + Math.floor(Math.random() * rateLimitMs * 0.3);
+              await sleep(jittered);
+            }
             const variables = {
               userId: restId,
               count: Math.min(40, Math.max(20, want - collected.length + 5)),
@@ -344,8 +387,8 @@ pipeline:
             })
             .sort((a, b) => (b.created_at || '').localeCompare(a.created_at || ''))
             .slice(0, want);
-          // 重新编号 rank
-          filtered.forEach((p, i) => { p.rank = i + 1; });
+          // 重新编号 rank + 标 rest_id（让外层脚本能更新 cache）
+          filtered.forEach((p, i) => { p.rank = i + 1; p._rest_id = restId; });
           return filtered;
         };
 
@@ -354,7 +397,10 @@ pipeline:
         const posts = [];
         let firstErr = null;
         for (let i = 0; i < handles.length; i++) {
-          if (i > 0 && interUserMs > 0) await sleep(interUserMs);
+          if (i > 0 && interUserMs > 0) {
+            const jittered = interUserMs + Math.floor(Math.random() * interUserMs * 0.5);
+            await sleep(jittered);
+          }
           const handle = handles[i];
           try {
             const userPosts = await fetchUserTimelineGql(handle, limit);
