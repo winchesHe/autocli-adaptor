@@ -292,6 +292,23 @@ pipeline:
           return d.toISOString();
         };
 
+        // 把 t.co 短链替换为真实 expanded_url（不动 media t.co —— media 走单独字段）
+        const expandTcoUrls = (text, legacy) => {
+          if (!text) return text || '';
+          const urls = legacy?.entities?.urls || [];
+          let out = text;
+          for (const u of urls) {
+            if (!u?.url || !u?.expanded_url) continue;
+            // 跳过指向自家 X media 的（已经在 media_urls 里）
+            if (u.expanded_url.includes('/photo/') || u.expanded_url.includes('/video/')) continue;
+            out = out.split(u.url).join(u.expanded_url);
+          }
+          // 移除 media 的 t.co（替换不了 expanded_url 但要清理掉）
+          const mediaTcos = (legacy?.extended_entities?.media || []).map((m) => m.url).filter(Boolean);
+          for (const m of mediaTcos) out = out.split(m).join('');
+          return out.trim();
+        };
+
         const tweetToPost = (result, rankHint, ownerHandle) => {
           const tweet = result?.tweet || result;
           if (!tweet) return null;
@@ -310,13 +327,49 @@ pipeline:
             .map((m) => m.media_url_https || m.media_url || '')
             .map(normalizeImageUrl)
             .filter(Boolean)));
+
+          // 主体文本：优先 note_tweet（长推），否则 full_text；展开 t.co
+          const baseText = expandTcoUrls(noteText || legacy.full_text || '', legacy);
+
+          // 引用推（quoted tweet）：把被引用 tweet 的作者+正文拼到 content 末尾
+          let quotedBlock = '';
+          const quoted = tweet.quoted_status_result?.result;
+          if (quoted) {
+            const qTweet = quoted.tweet || quoted;
+            const qLegacy = qTweet?.legacy || {};
+            const qNote = qTweet?.note_tweet?.note_tweet_results?.result?.text;
+            const qUser = qTweet?.core?.user_results?.result;
+            const qScreen = qUser?.legacy?.screen_name || qUser?.core?.screen_name || '';
+            const qText = expandTcoUrls(qNote || qLegacy.full_text || '', qLegacy);
+            if (qText) {
+              quotedBlock = `\n\n🔁 引用 @${qScreen}：\n${qText}`;
+            }
+          }
+
+          // 卡片（link preview）：如果是外链卡片，把卡片标题/描述拼到 content 末尾
+          let cardBlock = '';
+          const card = tweet.card?.legacy || tweet.card;
+          if (card?.binding_values && Array.isArray(card.binding_values)) {
+            const bv = {};
+            for (const item of card.binding_values) {
+              if (item?.key && item?.value) bv[item.key] = item.value.string_value || '';
+            }
+            const title = bv.title || bv.card_title || '';
+            const desc = bv.description || bv.card_description || '';
+            if (title || desc) {
+              cardBlock = `\n\n🔗 ${[title, desc].filter(Boolean).join(' — ')}`;
+            }
+          }
+
+          const fullContent = (baseText + quotedBlock + cardBlock).trim();
+
           return {
             rank: rankHint,
             id,
             author: screenName,
             created_at: createdAtIso,
             time_parse_status: createdAtIso ? 'ok' : 'missing_or_unparseable',
-            text: noteText || legacy.full_text || '',
+            text: fullContent,
             detail_text: '',
             url: `https://x.com/${screenName}/status/${id}`,
             media_urls: mediaUrls,
